@@ -715,7 +715,7 @@ exportBtn.addEventListener('click', async () => {
       audioBuffer,
       fps: exportFps,
       videoBitrate,
-      audioBitrate: 256_000,
+      audioBitrate: 192_000,
       drawFrame: (time) => {
         drawExportFrame(audioBuffer, time, exportSettings, spectrum);
       },

@@ -1,4 +1,5 @@
 import './style.css';
+import { renderMP4 } from "./browserExport";
 
 type VisualizerStyle = 'bars' | 'waveform';
 
@@ -82,8 +83,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <div class="field">
         <label for="exportFps">Export FPS</label>
         <select id="exportFps">
-          <option value="60" selected>60 FPS — recommended</option>
-          <option value="30">30 FPS</option>
+          <option value="30" selected>30 FPS — mobile / faster</option>
+          <option value="60">60 FPS — high quality / slower</option>
         </select>
       </div>
 
@@ -107,7 +108,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <div class="preview-wrap">
         <div class="preview-header">
           <span>LIVE PREVIEW</span>
-          <span class="badge" id="fpsBadge">1920×1080 · 60 FPS</span>
+          <span class="badge" id="fpsBadge">1920×1080 · 30 FPS</span>
         </div>
         <canvas id="canvas" width="1920" height="1080"></canvas>
         <div class="transport">
@@ -149,8 +150,8 @@ let cover = new Image();
 let coverReady = false;
 let audioContext: AudioContext | null = null;
 let analyser: AnalyserNode | null = null;
-let mediaDestination: MediaStreamAudioDestinationNode | null = null;
 let monitorGain: GainNode | null = null;
+let selectedAudioFile: File | null = null;
 let sourceNode: MediaElementAudioSourceNode | null = null;
 let frequencyData: Uint8Array<ArrayBuffer> | null = null;
 let waveformData: Uint8Array<ArrayBuffer> | null = null;
@@ -207,6 +208,7 @@ coverFile.addEventListener('change', () => {
 audioFile.addEventListener('change', async () => {
   const file = audioFile.files?.[0];
   if (!file) return;
+  selectedAudioFile = file;
   if (audioUrl) URL.revokeObjectURL(audioUrl);
   audioUrl = URL.createObjectURL(file);
   audio.src = audioUrl;
@@ -228,20 +230,18 @@ async function setupAudioGraph() {
     frequencyData = new Uint8Array(analyser.frequencyBinCount);
     waveformData = new Uint8Array(analyser.fftSize);
   }
-  if (!mediaDestination) mediaDestination = audioContext.createMediaStreamDestination();
   if (!monitorGain) {
     monitorGain = audioContext.createGain();
     monitorGain.gain.value = 1;
   }
 
-  try { sourceNode.disconnect(); } catch {}
-  try { analyser.disconnect(); } catch {}
-  try { monitorGain.disconnect(); } catch {}
+  try { sourceNode.disconnect(); } catch { }
+  try { analyser.disconnect(); } catch { }
+  try { monitorGain.disconnect(); } catch { }
 
   sourceNode.connect(analyser);
   analyser.connect(monitorGain);
   monitorGain.connect(audioContext.destination);
-  analyser.connect(mediaDestination);
 }
 
 playBtn.addEventListener('click', async () => {
@@ -407,6 +407,227 @@ function drawWaveform() {
   ctx.restore();
 }
 
+
+class ExportSpectrumAnalyzer {
+  private readonly fftSize = 2048;
+  private readonly real = new Float64Array(this.fftSize);
+  private readonly imag = new Float64Array(this.fftSize);
+  private readonly bitReverse = new Uint16Array(this.fftSize);
+  private readonly window = new Float64Array(this.fftSize);
+  private readonly bars: Float32Array;
+  private readonly channels: Float32Array[];
+  private lastAnalysisBucket = -1;
+
+  constructor(private readonly buffer: AudioBuffer, barCount: number) {
+    this.bars = new Float32Array(barCount);
+    this.channels = Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel));
+
+    const bits = Math.log2(this.fftSize);
+    for (let i = 0; i < this.fftSize; i++) {
+      let value = i;
+      let reversed = 0;
+      for (let bit = 0; bit < bits; bit++) {
+        reversed = (reversed << 1) | (value & 1);
+        value >>= 1;
+      }
+      this.bitReverse[i] = reversed;
+      this.window[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (this.fftSize - 1));
+    }
+  }
+
+  analyze(time: number, sensitivity: number): Float32Array {
+    // 30 analyses per second is enough for smooth movement, even in a 60 FPS export.
+    // At 60 FPS each analysis result is simply used for two adjacent frames.
+    const bucket = Math.floor(time * 30);
+    if (bucket === this.lastAnalysisBucket) return this.bars;
+
+    const centerSample = Math.floor(time * this.buffer.sampleRate);
+    const startSample = centerSample - Math.floor(this.fftSize / 2);
+
+    for (let i = 0; i < this.fftSize; i++) {
+      const sampleIndex = startSample + i;
+      let sample = 0;
+
+      if (sampleIndex >= 0 && sampleIndex < this.buffer.length) {
+        for (let channel = 0; channel < this.channels.length; channel++) {
+          sample += this.channels[channel][sampleIndex] ?? 0;
+        }
+        sample /= Math.max(1, this.channels.length);
+      }
+
+      const reversed = this.bitReverse[i];
+      this.real[reversed] = sample * this.window[i];
+      this.imag[reversed] = 0;
+    }
+
+    for (let size = 2; size <= this.fftSize; size <<= 1) {
+      const half = size >> 1;
+      const angle = (-2 * Math.PI) / size;
+
+      for (let start = 0; start < this.fftSize; start += size) {
+        for (let offset = 0; offset < half; offset++) {
+          const phase = angle * offset;
+          const cos = Math.cos(phase);
+          const sin = Math.sin(phase);
+          const even = start + offset;
+          const odd = even + half;
+
+          const oddReal = this.real[odd] * cos - this.imag[odd] * sin;
+          const oddImag = this.real[odd] * sin + this.imag[odd] * cos;
+          const evenReal = this.real[even];
+          const evenImag = this.imag[even];
+
+          this.real[even] = evenReal + oddReal;
+          this.imag[even] = evenImag + oddImag;
+          this.real[odd] = evenReal - oddReal;
+          this.imag[odd] = evenImag - oddImag;
+        }
+      }
+    }
+
+    const maxBin = Math.min(430, this.fftSize / 2 - 1);
+    const firstFrame = this.lastAnalysisBucket < 0;
+
+    for (let i = 0; i < this.bars.length; i++) {
+      const bin = Math.max(1, Math.floor((i / this.bars.length) * maxBin));
+      const magnitude = Math.hypot(this.real[bin], this.imag[bin]) / (this.fftSize / 2);
+      const db = 20 * Math.log10(Math.max(1e-7, magnitude));
+      let value = Math.max(0, Math.min(1, (db + 68) / 68));
+      value = Math.pow(value, 1.35);
+      value = Math.min(1, value * sensitivity);
+
+      // Similar to the live AnalyserNode smoothing, but deterministic.
+      this.bars[i] = firstFrame ? value : this.bars[i] * 0.72 + value * 0.28;
+    }
+
+    this.lastAnalysisBucket = bucket;
+    return this.bars;
+  }
+}
+
+function drawExportBars(
+  target: CanvasRenderingContext2D,
+  spectrum: ExportSpectrumAnalyzer,
+  time: number,
+  exportSettings: Settings
+) {
+  const bars = spectrum.analyze(time, exportSettings.sensitivity);
+  const barCount = bars.length;
+  const regionW = 1280;
+  const startX = (canvas.width - regionW) / 2;
+  const baseY = 925;
+  const maxH = 120;
+  const gap = 5;
+  const barW = (regionW - gap * (barCount - 1)) / barCount;
+
+  target.save();
+  target.fillStyle = exportSettings.accent;
+  target.shadowColor = exportSettings.accent;
+  target.shadowBlur = 12;
+  target.beginPath();
+
+  for (let i = 0; i < barCount; i++) {
+    const h = Math.max(3, bars[i] * maxH);
+    const x = startX + i * (barW + gap);
+    target.roundRect(x, baseY - h, barW, h, Math.min(7, barW / 2));
+  }
+
+  target.fill();
+  target.restore();
+}
+
+function drawExportWaveform(
+  target: CanvasRenderingContext2D,
+  buffer: AudioBuffer,
+  time: number,
+  exportSettings: Settings
+) {
+  const startX = 320;
+  const endX = canvas.width - 320;
+  const centerY = 875;
+  const amp = 90 * exportSettings.sensitivity;
+  const pointCount = 256;
+  const windowSamples = 2048;
+  const centerSample = Math.floor(time * buffer.sampleRate);
+  const firstSample = centerSample - Math.floor(windowSamples / 2);
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel));
+
+  target.save();
+  target.beginPath();
+  target.lineWidth = 6;
+  target.lineJoin = 'round';
+  target.lineCap = 'round';
+  target.strokeStyle = exportSettings.accent;
+  target.shadowColor = exportSettings.accent;
+  target.shadowBlur = 18;
+
+  for (let i = 0; i < pointCount; i++) {
+    const ratio = i / (pointCount - 1);
+    const sampleIndex = firstSample + Math.floor(ratio * (windowSamples - 1));
+    let sample = 0;
+
+    if (sampleIndex >= 0 && sampleIndex < buffer.length) {
+      for (let channel = 0; channel < channels.length; channel++) {
+        sample += channels[channel][sampleIndex] ?? 0;
+      }
+      sample /= Math.max(1, channels.length);
+    }
+
+    const x = startX + (endX - startX) * ratio;
+    const y = centerY + sample * amp;
+    if (i === 0) target.moveTo(x, y);
+    else target.lineTo(x, y);
+  }
+
+  target.stroke();
+  target.restore();
+}
+
+function drawProgressAt(
+  target: CanvasRenderingContext2D,
+  currentTime: number,
+  duration: number,
+  accent: string
+) {
+  const x = 320;
+  const y = 1000;
+  const w = canvas.width - 640;
+  const ratio = duration > 0 ? Math.min(1, currentTime / duration) : 0;
+
+  target.save();
+  target.fillStyle = 'rgba(255,255,255,.16)';
+  roundedRect(target, x, y, w, 8, 4);
+  target.fill();
+
+  target.fillStyle = accent;
+  if (ratio > 0) {
+    roundedRect(target, x, y, w * ratio, 8, 4);
+    target.fill();
+  }
+
+  target.font = '500 20px Inter, sans-serif';
+  target.fillStyle = 'rgba(255,255,255,.55)';
+  target.textAlign = 'left';
+  target.fillText(formatTime(currentTime), x, y - 18);
+  target.textAlign = 'right';
+  target.fillText(formatTime(duration), x + w, y - 18);
+  target.restore();
+}
+
+function drawExportFrame(
+  buffer: AudioBuffer,
+  time: number,
+  exportSettings: Settings,
+  spectrum: ExportSpectrumAnalyzer
+) {
+  ctx.drawImage(staticCanvas, 0, 0);
+
+  if (exportSettings.style === 'bars') drawExportBars(ctx, spectrum, time, exportSettings);
+  else drawExportWaveform(ctx, buffer, time, exportSettings);
+
+  drawProgressAt(ctx, time, buffer.duration, exportSettings.accent);
+}
+
 function formatTime(seconds: number) {
   if (!Number.isFinite(seconds)) return '0:00';
   const m = Math.floor(seconds / 60);
@@ -415,28 +636,8 @@ function formatTime(seconds: number) {
 }
 
 function drawProgress() {
-  const x = 320;
-  const y = 1000;
-  const w = canvas.width - 640;
   const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
-  const ratio = duration > 0 ? Math.min(1, audio.currentTime / duration) : 0;
-
-  ctx.save();
-  ctx.fillStyle = 'rgba(255,255,255,.16)';
-  roundedRect(ctx, x, y, w, 8, 4);
-  ctx.fill();
-
-  ctx.fillStyle = settings.accent;
-  roundedRect(ctx, x, y, w * ratio, 8, 4);
-  ctx.fill();
-
-  ctx.font = '500 20px Inter, sans-serif';
-  ctx.fillStyle = 'rgba(255,255,255,.55)';
-  ctx.textAlign = 'left';
-  ctx.fillText(formatTime(audio.currentTime), x, y - 18);
-  ctx.textAlign = 'right';
-  ctx.fillText(formatTime(duration), x + w, y - 18);
-  ctx.restore();
+  drawProgressAt(ctx, audio.currentTime, duration, settings.accent);
 }
 
 let renderFrameCounter = 0;
@@ -444,39 +645,25 @@ let renderFpsWindowStart = performance.now();
 let measuredRenderFps = 60;
 
 function render(now = performance.now()) {
-  if (staticSceneDirty) rebuildStaticScene();
-  ctx.drawImage(staticCanvas, 0, 0);
-  if (settings.style === 'bars') drawBars();
-  else drawWaveform();
-  drawProgress();
+  if (!exporting) {
+    if (staticSceneDirty) rebuildStaticScene();
+    ctx.drawImage(staticCanvas, 0, 0);
+    if (settings.style === 'bars') drawBars();
+    else drawWaveform();
+    drawProgress();
 
-  renderFrameCounter++;
-  const elapsed = now - renderFpsWindowStart;
-  if (elapsed >= 1000) {
-    measuredRenderFps = (renderFrameCounter * 1000) / elapsed;
-    renderFrameCounter = 0;
-    renderFpsWindowStart = now;
+    renderFrameCounter++;
+    const elapsed = now - renderFpsWindowStart;
+    if (elapsed >= 1000) {
+      measuredRenderFps = (renderFrameCounter * 1000) / elapsed;
+      renderFrameCounter = 0;
+      renderFpsWindowStart = now;
+    }
   }
 
   requestAnimationFrame(render);
 }
 render();
-
-type RecorderFormat = { mimeType: string };
-
-function bestRecorderFormat(): RecorderFormat {
-  const webmOptions = [
-    'video/webm;codecs=vp9,opus',
-    'video/webm;codecs=vp8,opus',
-    'video/webm'
-  ];
-
-  for (const mimeType of webmOptions) {
-    if (MediaRecorder.isTypeSupported(mimeType)) return { mimeType };
-  }
-
-  throw new Error('This browser does not expose a supported WebM MediaRecorder format.');
-}
 
 function exposeDownload(blob: Blob, fileName: string) {
   if (renderedVideoUrl) URL.revokeObjectURL(renderedVideoUrl);
@@ -488,7 +675,8 @@ function exposeDownload(blob: Blob, fileName: string) {
 }
 
 exportBtn.addEventListener('click', async () => {
-  if (!audio.src || !audioContext || !mediaDestination || !monitorGain || exporting) return;
+  if (!selectedAudioFile || exporting) return;
+
   exporting = true;
   exportBtn.disabled = true;
   playBtn.disabled = true;
@@ -504,81 +692,68 @@ exportBtn.addEventListener('click', async () => {
     downloadBtn.removeAttribute('href');
     downloadBtn.removeAttribute('download');
 
-    await audioContext.resume();
     audio.pause();
     audio.currentTime = 0;
-    monitorGain.gain.value = 0;
 
-    const exportFps = Number(exportFpsSelect.value) === 30 ? 30 : 60;
-    const canvasStream = canvas.captureStream(exportFps);
-    const audioTrack = mediaDestination.stream.getAudioTracks()[0];
-    if (!audioTrack) throw new Error('No audio track was available for export.');
-    canvasStream.addTrack(audioTrack);
+    // Freeze the current look for the whole render.
+    if (staticSceneDirty) rebuildStaticScene();
+    const exportSettings: Settings = { ...settings };
+    const exportFps = Number(exportFpsSelect.value) === 60 ? 60 : 30;
 
-    const format = bestRecorderFormat();
-    status.textContent = `Recording ${exportFps} FPS in real time… renderer currently ~${Math.round(measuredRenderFps)} FPS. Keep this tab visible.`;
+    status.textContent = 'Decoding audio in your browser…';
+    const audioBuffer = await decodeAudioFile(selectedAudioFile);
+    const spectrum = new ExportSpectrumAnalyzer(audioBuffer, exportSettings.barCount);
 
-    const recorder = new MediaRecorder(canvasStream, {
-      mimeType: format.mimeType,
-      videoBitsPerSecond: exportFps === 60 ? 20_000_000 : 12_000_000,
-      audioBitsPerSecond: 320_000
-    });
-
-    const chunks: BlobPart[] = [];
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunks.push(event.data);
-    };
-
-    const stopped = new Promise<void>((resolve, reject) => {
-      recorder.onstop = () => resolve();
-      recorder.onerror = () => reject(new Error('The browser MediaRecorder reported an export error.'));
-    });
-
-    const finished = new Promise<void>((resolve) => {
-      const onEnded = () => {
-        audio.removeEventListener('ended', onEnded);
-        resolve();
-      };
-      audio.addEventListener('ended', onEnded);
-    });
-
-    recorder.start(1000);
-    await audio.play();
-    await finished;
-    recorder.stop();
-    await stopped;
-
-    if (chunks.length === 0) throw new Error('Recording finished but the browser produced no video data.');
-
-    const safeAuthor = (settings.author || 'artist').replace(/[^a-z0-9-_ ]/gi, '').trim();
-    const safeTitle = (settings.title || 'visualizer').replace(/[^a-z0-9-_ ]/gi, '').trim();
+    const safeAuthor = (exportSettings.author || 'artist').replace(/[^a-z0-9-_ ]/gi, '').trim();
+    const safeTitle = (exportSettings.title || 'visualizer').replace(/[^a-z0-9-_ ]/gi, '').trim();
     const baseName = `${safeAuthor || 'artist'} - ${safeTitle || 'visualizer'}`;
-    const recordedBlob = new Blob(chunks, { type: recorder.mimeType || format.mimeType });
 
-    if (recordedBlob.size === 0) throw new Error('Recording finished but the output file was empty.');
+    const videoBitrate = exportFps === 60 ? 12_000_000 : 8_000_000;
 
-    status.textContent = `Recording finished. Converting to constant ${exportFps} FPS H.264 MP4 with FFmpeg…`;
-    const response = await fetch(`/api/convert?fps=${exportFps}`, {
-      method: 'POST',
-      headers: { 'Content-Type': recordedBlob.type || 'video/webm' },
-      body: recordedBlob
+    const mp4 = await renderMP4({
+      canvas,
+      audioBuffer,
+      fps: exportFps,
+      videoBitrate,
+      audioBitrate: 256_000,
+      drawFrame: (time) => {
+        drawExportFrame(audioBuffer, time, exportSettings, spectrum);
+      },
+      onProgress: (progress) => {
+        const percent = Math.round(progress * 100);
+        status.textContent = `Rendering ${exportFps} FPS MP4 locally on this device… ${percent}%`;
+      }
     });
 
-    if (!response.ok) throw new Error(await response.text());
-    const mp4 = await response.blob();
-    if (mp4.size === 0) throw new Error('FFmpeg returned an empty MP4 file.');
+    if (mp4.size === 0) throw new Error('The browser encoder returned an empty MP4 file.');
+
     exposeDownload(mp4, `${baseName}.mp4`);
-    status.textContent = `${exportFps} FPS MP4 ready. Renderer averaged around ${Math.round(measuredRenderFps)} FPS near the end. Click Download MP4 to save it.`;
+    status.textContent = `${exportFps} FPS MP4 ready (${(mp4.size / 1024 / 1024).toFixed(1)} MB). Click Download MP4 to save it.`;
   } catch (error) {
     console.error(error);
     status.textContent = error instanceof Error ? error.message : 'Export failed.';
   } finally {
-    monitorGain.gain.value = 1;
     audio.currentTime = 0;
     exporting = false;
     exportBtn.disabled = false;
     playBtn.disabled = false;
     pauseBtn.disabled = false;
     restartBtn.disabled = false;
+    renderFpsWindowStart = performance.now();
+    renderFrameCounter = 0;
   }
 });
+
+async function decodeAudioFile(file: File): Promise<AudioBuffer> {
+
+  const audioContext = new AudioContext();
+
+  const arrayBuffer = await file.arrayBuffer();
+
+  const audioBuffer =
+    await audioContext.decodeAudioData(arrayBuffer);
+
+  await audioContext.close();
+
+  return audioBuffer;
+}
